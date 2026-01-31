@@ -1,0 +1,1490 @@
+using System;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Text;
+using System.Diagnostics; // 添加这一行以支持进程操作
+
+namespace Remote_Command
+{
+    /// <summary>
+    /// 监听UDP广播消息并处理命令的类
+    /// </summary>
+    public class UdpListener
+    {
+        private const int ListenPort = 6743;
+        private UdpClient _udpClient;
+        private bool _isRunning;
+        
+        // 基本UDP服务端地址，用于发送指令和返回数据
+        private static IPEndPoint _baseServerEndpoint;
+        
+        // 返回数据的端口
+        private const int ResponsePort = 6746;
+        
+        // 虚拟网卡名称列表
+        private readonly string[] _virtualNetworkAdapters = {
+            "VirtualBox Host-Only Network",
+            "VMware Network Adapter VMnet1",
+            "VMware Network Adapter VMnet8"
+        };
+
+        /// <summary>
+        /// 获取基本UDP服务端地址
+        /// </summary>
+        /// <returns>基本UDP服务端地址</returns>
+        public static IPEndPoint GetBaseServerEndpoint()
+        {
+            return _baseServerEndpoint;
+        }
+
+        /// <summary>
+        /// 启动UDP监听器
+        /// </summary>
+        public void StartListening()
+        {
+            try
+            {
+                Logger.LogInfo("开始启动UDP监听器");
+                
+                // 获取非虚拟网卡的IP地址
+                var localIp = GetNonVirtualLocalIpAddress();
+                if (localIp == null)
+                {
+                    Logger.LogError("未找到有效的非虚拟网卡IP地址");
+                    return;
+                }
+
+                Logger.LogInfo($"使用IP地址进行监听: {localIp}");
+                
+                // 创建UDP客户端并绑定到指定端口
+                var localEndPoint = new IPEndPoint(localIp, ListenPort);
+                _udpClient = new UdpClient();
+                _udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _udpClient.Client.Bind(localEndPoint);
+                _isRunning = true;
+                
+                Logger.LogInfo($"UDP监听器已在端口 {ListenPort} 上启动");
+
+                // 允许接收广播
+                _udpClient.EnableBroadcast = true;
+                
+                // 从配置文件读取UDP服务器地址
+                var configuredIp = AppInitializer.ReadUdpServerIp();
+                if (configuredIp != null)
+                {
+                    _baseServerEndpoint = new IPEndPoint(configuredIp, ResponsePort);
+                    Logger.LogInfo($"从配置文件加载UDP服务器地址: {_baseServerEndpoint}");
+                }
+                
+                // 开始异步接收数据
+                _udpClient.BeginReceive(ReceiveCallback, null);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"启动UDP监听器时发生错误: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 停止UDP监听器
+        /// </summary>
+        public void StopListening()
+        {
+            _isRunning = false;
+            _udpClient?.Close();
+            Logger.LogInfo("UDP监听器已停止");
+        }
+
+        /// <summary>
+        /// 向基本UDP服务端发送响应数据
+        /// </summary>
+        /// <param name="responseData">要发送的响应数据</param>
+        public static void SendResponseToBaseServer(string responseData)
+        {
+            if (_baseServerEndpoint == null)
+            {
+                Logger.LogError("基本UDP服务端地址未设置，无法发送响应数据");
+                return;
+            }
+
+            try
+            {
+                using (UdpClient client = new UdpClient())
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(responseData);
+                    client.Send(data, data.Length, _baseServerEndpoint);
+                    Logger.LogInfo($"向基本UDP服务端 {_baseServerEndpoint} 发送响应数据: {responseData}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"向基本UDP服务端发送响应数据时发生错误: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 异步接收数据的回调方法
+        /// </summary>
+        private void ReceiveCallback(IAsyncResult ar)
+        {
+            try
+            {
+                if (!_isRunning || _udpClient == null) return;
+                
+                var remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+                byte[] receivedBytes = _udpClient.EndReceive(ar, ref remoteEndPoint);
+                string receivedMessage = Encoding.UTF8.GetString(receivedBytes);
+                
+                Logger.LogInfo($"收到来自 {remoteEndPoint} 的UDP消息: {receivedMessage}");
+                
+                ProcessReceivedMessage(receivedMessage, remoteEndPoint);
+                
+                // 继续接收下一个数据包
+                if (_isRunning)
+                {
+                    _udpClient.BeginReceive(ReceiveCallback, null);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // 当_udpClient被关闭时会抛出此异常，属于正常情况
+                Logger.LogInfo("UDP客户端已关闭");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"接收UDP数据时发生错误: {ex.Message}");
+                if (_isRunning)
+                {
+                    try
+                    {
+                        _udpClient?.BeginReceive(ReceiveCallback, null);
+                    }
+                    catch (Exception ex2)
+                    {
+                        Logger.LogError($"重新开始接收UDP数据时发生错误: {ex2.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 处理接收到的消息
+        /// </summary>
+        /// <param name="message">接收到的消息</param>
+        /// <param name="remoteEndpoint">远程终端点</param>
+        private void ProcessReceivedMessage(string message, IPEndPoint remoteEndpoint)
+        {
+            if (string.IsNullOrEmpty(message))
+                return;
+
+            // 检查是否为链接消息
+            if (message.StartsWith("MOT-RC link "))
+            {
+                string ipAddressStr = message.Substring(12); // 移除"MOT-RC link "前缀
+                if (IPAddress.TryParse(ipAddressStr, out IPAddress baseServerIp))
+                {
+                    // 设置基本UDP服务端地址
+                    _baseServerEndpoint = new IPEndPoint(baseServerIp, ResponsePort);
+                    Logger.LogInfo($"设置基本UDP服务端地址为: {_baseServerEndpoint}");
+                    
+                    // 保存到配置文件
+                    AppInitializer.SaveUdpServerIp(baseServerIp);
+                    
+                    // 发送确认响应
+                    SendResponseToBaseServer("MOT-RC ACK");
+                }
+                else
+                {
+                    Logger.LogError($"无效的IP地址格式: {ipAddressStr}");
+                }
+                return;
+            }
+
+            // 检查是否为动态命令消息
+            if (message.StartsWith("MOT-RC cmd "))
+            {
+                string commandStr = message.Substring(11); // 移除"MOT-RC cmd "前缀
+                Logger.LogInfo($"收到动态命令: {commandStr}");
+                DynamicCommandExecutor.ExecuteDynamicCommand(commandStr, true);
+                return;
+            }
+
+            // 如果已设置基本服务端地址，检查消息是否来自该地址
+            if (_baseServerEndpoint != null && 
+                remoteEndpoint.Address.Equals(_baseServerEndpoint.Address))
+            {
+                // 处理来自基本服务端的命令
+                ProcessCommandMessage(message);
+            }
+            else
+            {
+                // 处理广播命令（向后兼容）
+                ProcessBroadcastMessage(message);
+            }
+        }
+
+        /// <summary>
+        /// 处理来自基本服务端的命令消息
+        /// </summary>
+        /// <param name="message">命令消息</param>
+        private void ProcessCommandMessage(string message)
+        {
+            if (!message.StartsWith("MOT-RC "))
+                return;
+
+            string command = message.Substring(7); // 移除"MOT-RC "前缀
+            
+            // 处理黑白名单模式切换命令
+            if (command == "mode whitelist")
+            {
+                ConfigManager.SetUseWhitelist(true);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到白名单模式");
+                Logger.LogInfo("已切换到白名单模式");
+                return;
+            }
+            else if (command == "mode blacklist")
+            {
+                ConfigManager.SetUseWhitelist(false);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到黑名单模式");
+                Logger.LogInfo("已切换到黑名单模式");
+                return;
+            }
+            
+            // 处理黑名单和白名单命令
+            if (command.StartsWith("black add "))
+            {
+                string appList = command.Substring(10); // 移除"black add "前缀
+                HandleBlacklistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("black del "))
+            {
+                string appList = command.Substring(10); // 移除"black del "前缀
+                HandleBlacklistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("width add "))
+            {
+                string appList = command.Substring(10); // 移除"width add "前缀
+                HandleWhitelistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("width del "))
+            {
+                string appList = command.Substring(10); // 移除"width del "前缀
+                HandleWhitelistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("path_black add ")) // 添加路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black add "前缀
+                HandlePathBlacklistAdd(pathList);
+                return;
+            }
+            else if (command.StartsWith("path_black del ")) // 删除路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black del "前缀
+                HandlePathBlacklistRemove(pathList);
+                return;
+            }
+            
+            // 处理进程终止命令
+            if (command.StartsWith("process taskkill "))
+            {
+                string processName = command.Substring(17); // 移除"process taskkill "前缀
+                Logger.LogInfo($"收到终止进程命令: {processName}");
+                TerminateProcess(processName);
+                return;
+            }
+            
+            switch (command)
+            {
+                case "runcmd":
+                    Logger.LogInfo("收到runcmd命令，准备执行批处理文件");
+                    ExecuteBatchFile();
+                    break;
+                case "update":
+                    Logger.LogInfo("收到update命令，准备重新获取批处理文件");
+                    UpdateBatchFile();
+                    break;
+                case "process list":
+                    Logger.LogInfo("收到process list命令，准备获取进程列表");
+                    SendProcessList();
+                    break;
+                case "process app":
+                    Logger.LogInfo("收到process app命令，准备获取带路径的应用进程列表");
+                    SendAppProcessListWithPaths();
+                    break;
+                default:
+                    Logger.LogInfo($"收到未知命令: {command}");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 处理广播消息（向后兼容）
+        /// </summary>
+        /// <param name="message">广播消息</param>
+        private void ProcessBroadcastMessage(string message)
+        {
+            if (!message.StartsWith("MOT-RC "))
+                return;
+
+            string command = message.Substring(7); // 移除"MOT-RC "前缀
+            
+            // 处理黑白名单模式切换命令
+            if (command == "mode whitelist")
+            {
+                ConfigManager.SetUseWhitelist(true);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到白名单模式");
+                Logger.LogInfo("已切换到白名单模式");
+                return;
+            }
+            else if (command == "mode blacklist")
+            {
+                ConfigManager.SetUseWhitelist(false);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到黑名单模式");
+                Logger.LogInfo("已切换到黑名单模式");
+                return;
+            }
+            
+            // 处理黑名单和白名单命令
+            if (command.StartsWith("black add "))
+            {
+                string appList = command.Substring(10); // 移除"black add "前缀
+                HandleBlacklistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("black del "))
+            {
+                string appList = command.Substring(10); // 移除"black del "前缀
+                HandleBlacklistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("width add "))
+            {
+                string appList = command.Substring(10); // 移除"width add "前缀
+                HandleWhitelistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("width del "))
+            {
+                string appList = command.Substring(10); // 移除"width del "前缀
+                HandleWhitelistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("path_black add ")) // 添加路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black add "前缀
+                HandlePathBlacklistAdd(pathList);
+                return;
+            }
+            else if (command.StartsWith("path_black del ")) // 删除路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black del "前缀
+                HandlePathBlacklistRemove(pathList);
+                return;
+            }
+            
+            // 处理进程终止命令
+            if (command.StartsWith("process taskkill "))
+            {
+                string processName = command.Substring(17); // 移除"process taskkill "前缀
+                Logger.LogInfo($"收到广播终止进程命令: {processName}");
+                TerminateProcess(processName);
+                return;
+            }
+            
+            switch (command)
+            {
+                case "runcmd":
+                    Logger.LogInfo("收到广播runcmd命令，准备执行批处理文件");
+                    ExecuteBatchFile();
+                    break;
+                case "update":
+                    Logger.LogInfo("收到广播update命令，准备重新获取批处理文件");
+                    UpdateBatchFile();
+                    break;
+                case "process list":
+                    Logger.LogInfo("收到广播process list命令，准备获取进程列表");
+                    SendProcessList();
+                    break;
+                case "process app":
+                    Logger.LogInfo("收到广播process app命令，准备获取带路径的应用进程列表");
+                    SendAppProcessListWithPaths();
+                    break;
+                default:
+                    Logger.LogInfo($"收到未知广播命令: {command}");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 执行现有的批处理文件
+        /// </summary>
+        private void ExecuteBatchFile()
+        {
+            var batchFilePath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "downloaded_command.bat");
+            // UDP命令触发的执行需要上传FTP日志，cmd指令指定的代码不需要上传
+            // 但对于runcmd命令，应该上传日志，所以isCmdSpecified应为false
+            CommandExecutor.ExecuteCommand(batchFilePath, true, true, false);
+        }
+
+        /// <summary>
+        /// 重新获取批处理文件
+        /// </summary>
+        private void UpdateBatchFile()
+        {
+            var fetcher = new CommandFetcher();
+            var command = fetcher.FetchCommand();
+            
+            if (command != null)
+            {
+                try
+                {
+                    var executionDir = AppDomain.CurrentDomain.BaseDirectory;
+                    var commandFilePath = System.IO.Path.Combine(executionDir, "downloaded_command.bat");
+                    System.IO.File.WriteAllText(commandFilePath, command);
+                    Logger.LogInfo($"新的批处理命令已保存到程序运行目录: {commandFilePath}");
+                    
+                    // 向基本UDP服务端发送更新确认
+                    SendResponseToBaseServer("MOT-RC UPD 批处理文件更新完成");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"保存新的批处理命令到文件时出错: {ex.Message}");
+                    SendResponseToBaseServer($"MOT-RC ERR 批处理文件更新失败: {ex.Message}");
+                }
+            }
+            else
+            {
+                Logger.LogError("更新批处理文件失败，未能获取到任何命令");
+                SendResponseToBaseServer("MOT-RC ERR 更新批处理文件失败，未能获取到任何命令");
+            }
+        }
+
+        /// <summary>
+        /// 获取并发送进程列表到基本UDP服务端
+        /// </summary>
+        private void SendProcessList()
+        {
+            try
+            {
+                // 从ProcessListProvider获取进程列表
+                string processList = ProcessListProvider.GetProcessList();
+                
+                // 构造响应消息
+                string responseMessage = $"MOT-RC process pl {processList}";
+                
+                // 发送到基本UDP服务端
+                SendResponseToBaseServer(responseMessage);
+                
+                Logger.LogInfo("进程列表已发送到基本UDP服务端");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"获取或发送进程列表时发生错误: {ex.Message}");
+                SendResponseToBaseServer($"MOT-RC ERR 获取进程列表失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 获取并发送带路径的应用进程列表到基本UDP服务端
+        /// </summary>
+        private void SendAppProcessListWithPaths()
+        {
+            try
+            {
+                // 从ProcessListProvider获取带路径的应用进程列表
+                string appProcessList = ProcessListProvider.GetAppProcessListWithPaths();
+                
+                // 构造响应消息
+                string responseMessage = $"MOT-RC process {appProcessList}";
+                
+                // 发送到基本UDP服务端
+                SendResponseToBaseServer(responseMessage);
+                
+                Logger.LogInfo("带路径的应用进程列表已发送到基本UDP服务端");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"获取或发送应用进程列表时发生错误: {ex.Message}");
+                SendResponseToBaseServer($"MOT-RC ERR 获取应用进程列表失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 终止指定进程并向基本UDP服务端发送结果
+        /// </summary>
+        /// <param name="processName">要终止的进程名</param>
+        private void TerminateProcess(string processName)
+        {
+            try
+            {
+                string result = ProcessTerminator.TerminateProcessByName(processName);
+                string responseMessage = $"MOT-RC process taskkill result: {result}";
+                SendResponseToBaseServer(responseMessage);
+                Logger.LogInfo($"进程终止操作完成: {result}");
+            }
+            catch (Exception ex)
+            {
+                string errorMessage = $"终止进程 '{processName}' 时发生错误: {ex.Message}";
+                Logger.LogError(errorMessage);
+                SendResponseToBaseServer($"MOT-RC ERR {errorMessage}");
+            }
+        }
+
+        /// <summary>
+        /// 处理添加到黑名单的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleBlacklistAdd(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int addedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理重复项
+                        ConfigManager.AddToBlacklist(trimmedApp);
+                        addedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC black add result: 成功添加 {addedCount} 个应用程序到黑名单";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理黑名单添加命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理从黑名单移除的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleBlacklistRemove(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int removedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理不存在的项
+                        ConfigManager.RemoveFromBlacklist(trimmedApp);
+                        removedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC black del result: 成功从黑名单移除 {removedCount} 个应用程序";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理黑名单移除命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理添加到白名单的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleWhitelistAdd(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int addedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理重复项
+                        ConfigManager.AddToWhitelist(trimmedApp);
+                        addedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC width add result: 成功添加 {addedCount} 个应用程序到白名单";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理白名单添加命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理从白名单移除的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleWhitelistRemove(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int removedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理不存在的项
+                        ConfigManager.RemoveFromWhitelist(trimmedApp);
+                        removedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC width del result: 成功从白名单移除 {removedCount} 个应用程序";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理白名单移除命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理添加到路径黑名单的命令
+        /// </summary>
+        /// <param name="pathList">以逗号分隔的路径列表</param>
+        private void HandlePathBlacklistAdd(string pathList)
+        {
+            try
+            {
+                string[] paths = pathList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int addedCount = 0;
+                
+                foreach (string path in paths)
+                {
+                    string trimmedPath = path.Trim();
+                    if (!string.IsNullOrEmpty(trimmedPath))
+                    {
+                        // PathBlacklistManager会自动处理重复项
+                        if (PathBlacklistManager.AddPathToBlacklist(trimmedPath))
+                        {
+                            addedCount++;
+                        }
+                    }
+                }
+                
+                string response = $"MOT-RC path_black add result: 成功添加 {addedCount} 个路径到路径黑名单";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+                
+                // 触发一次进程检查
+                System.Threading.ThreadPool.QueueUserWorkItem(_ => {
+                    System.Threading.Thread.Sleep(1000); // 等待1秒，确保进程已完全启动
+                    ProcessMonitor.CheckProcessesOnce();
+                });
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理路径黑名单添加命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理从路径黑名单移除的命令
+        /// </summary>
+        /// <param name="pathList">以逗号分隔的路径列表</param>
+        private void HandlePathBlacklistRemove(string pathList)
+        {
+            try
+            {
+                string[] paths = pathList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int removedCount = 0;
+                
+                foreach (string path in paths)
+                {
+                    string trimmedPath = path.Trim();
+                    if (!string.IsNullOrEmpty(trimmedPath))
+                    {
+                        // PathBlacklistManager会自动处理不存在的项
+                        if (PathBlacklistManager.RemovePathFromBlacklist(trimmedPath))
+                        {
+                            removedCount++;
+                        }
+                    }
+                }
+                
+                string response = $"MOT-RC path_black del result: 成功从路径黑名单移除 {removedCount} 个路径";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理路径黑名单移除命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 获取非虚拟网卡的本地IP地址
+        /// </summary>
+        /// <returns>非虚拟网卡的IPv4地址，如果没有找到则返回null</returns>
+        private IPAddress GetNonVirtualLocalIpAddress()
+        {
+            try
+            {
+                // 获取所有网络接口
+                NetworkInterface[] networkInterfaces = NetworkInterface.GetAllNetworkInterfaces();
+                
+                foreach (NetworkInterface ni in networkInterfaces)
+                {
+                    // 检查是否为虚拟网卡
+                    bool isVirtual = _virtualNetworkAdapters.Any(adapter => 
+                        ni.Name.Equals(adapter, StringComparison.OrdinalIgnoreCase) || 
+                        ni.Description.IndexOf(adapter, StringComparison.OrdinalIgnoreCase) >= 0);
+                    
+                    // 如果不是虚拟网卡且处于活动状态
+                    if (!isVirtual && ni.OperationalStatus == OperationalStatus.Up)
+                    {
+                        IPInterfaceProperties properties = ni.GetIPProperties();
+                        
+                        // 查找IPv4地址
+                        foreach (UnicastIPAddressInformation ip in properties.UnicastAddresses)
+                        {
+                            if (ip.Address.AddressFamily == AddressFamily.InterNetwork && 
+                                !IPAddress.IsLoopback(ip.Address))
+                            {
+                                Logger.LogInfo($"找到非虚拟网卡IP地址: {ip.Address} ({ni.Name})");
+                                return ip.Address;
+                            }
+                        }
+                    }
+                }
+                
+                // 如果没有找到非虚拟网卡，则返回null，迫使用户解决网络问题
+                Logger.LogInfo("未找到非虚拟网卡");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"获取本地IP地址时发生错误: {ex.Message}");
+                return null;
+            }
+        }
+    }
+}using System;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Text;
+using System.Diagnostics; // 添加这一行以支持进程操作
+
+namespace Remote_Command
+{
+    /// <summary>
+    /// 监听UDP广播消息并处理命令的类
+    /// </summary>
+    public class UdpListener
+    {
+        private const int ListenPort = 6743;
+        private UdpClient _udpClient;
+        private bool _isRunning;
+        
+        // 基本UDP服务端地址，用于发送指令和返回数据
+        private static IPEndPoint _baseServerEndpoint;
+        
+        // 返回数据的端口
+        private const int ResponsePort = 6746;
+        
+        // 虚拟网卡名称列表
+        private readonly string[] _virtualNetworkAdapters = {
+            "VirtualBox Host-Only Network",
+            "VMware Network Adapter VMnet1",
+            "VMware Network Adapter VMnet8"
+        };
+
+        /// <summary>
+        /// 获取基本UDP服务端地址
+        /// </summary>
+        /// <returns>基本UDP服务端地址</returns>
+        public static IPEndPoint GetBaseServerEndpoint()
+        {
+            return _baseServerEndpoint;
+        }
+
+        /// <summary>
+        /// 启动UDP监听器
+        /// </summary>
+        public void StartListening()
+        {
+            try
+            {
+                Logger.LogInfo("开始启动UDP监听器");
+                
+                // 获取非虚拟网卡的IP地址
+                var localIp = GetNonVirtualLocalIpAddress();
+                if (localIp == null)
+                {
+                    Logger.LogError("未找到有效的非虚拟网卡IP地址");
+                    return;
+                }
+
+                Logger.LogInfo($"使用IP地址进行监听: {localIp}");
+                
+                // 创建UDP客户端并绑定到指定端口
+                var localEndPoint = new IPEndPoint(localIp, ListenPort);
+                _udpClient = new UdpClient();
+                _udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _udpClient.Client.Bind(localEndPoint);
+                _isRunning = true;
+                
+                Logger.LogInfo($"UDP监听器已在端口 {ListenPort} 上启动");
+
+                // 允许接收广播
+                _udpClient.EnableBroadcast = true;
+                
+                // 从配置文件读取UDP服务器地址
+                var configuredIp = AppInitializer.ReadUdpServerIp();
+                if (configuredIp != null)
+                {
+                    _baseServerEndpoint = new IPEndPoint(configuredIp, ResponsePort);
+                    Logger.LogInfo($"从配置文件加载UDP服务器地址: {_baseServerEndpoint}");
+                }
+                
+                // 开始异步接收数据
+                _udpClient.BeginReceive(ReceiveCallback, null);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"启动UDP监听器时发生错误: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 停止UDP监听器
+        /// </summary>
+        public void StopListening()
+        {
+            _isRunning = false;
+            _udpClient?.Close();
+            Logger.LogInfo("UDP监听器已停止");
+        }
+
+        /// <summary>
+        /// 向基本UDP服务端发送响应数据
+        /// </summary>
+        /// <param name="responseData">要发送的响应数据</param>
+        public static void SendResponseToBaseServer(string responseData)
+        {
+            if (_baseServerEndpoint == null)
+            {
+                Logger.LogError("基本UDP服务端地址未设置，无法发送响应数据");
+                return;
+            }
+
+            try
+            {
+                using (UdpClient client = new UdpClient())
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(responseData);
+                    client.Send(data, data.Length, _baseServerEndpoint);
+                    Logger.LogInfo($"向基本UDP服务端 {_baseServerEndpoint} 发送响应数据: {responseData}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"向基本UDP服务端发送响应数据时发生错误: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 异步接收数据的回调方法
+        /// </summary>
+        private void ReceiveCallback(IAsyncResult ar)
+        {
+            try
+            {
+                if (!_isRunning || _udpClient == null) return;
+                
+                var remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+                byte[] receivedBytes = _udpClient.EndReceive(ar, ref remoteEndPoint);
+                string receivedMessage = Encoding.UTF8.GetString(receivedBytes);
+                
+                Logger.LogInfo($"收到来自 {remoteEndPoint} 的UDP消息: {receivedMessage}");
+                
+                ProcessReceivedMessage(receivedMessage, remoteEndPoint);
+                
+                // 继续接收下一个数据包
+                if (_isRunning)
+                {
+                    _udpClient.BeginReceive(ReceiveCallback, null);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // 当_udpClient被关闭时会抛出此异常，属于正常情况
+                Logger.LogInfo("UDP客户端已关闭");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"接收UDP数据时发生错误: {ex.Message}");
+                if (_isRunning)
+                {
+                    try
+                    {
+                        _udpClient?.BeginReceive(ReceiveCallback, null);
+                    }
+                    catch (Exception ex2)
+                    {
+                        Logger.LogError($"重新开始接收UDP数据时发生错误: {ex2.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 处理接收到的消息
+        /// </summary>
+        /// <param name="message">接收到的消息</param>
+        /// <param name="remoteEndpoint">远程终端点</param>
+        private void ProcessReceivedMessage(string message, IPEndPoint remoteEndpoint)
+        {
+            if (string.IsNullOrEmpty(message))
+                return;
+
+            // 检查是否为链接消息
+            if (message.StartsWith("MOT-RC link "))
+            {
+                string ipAddressStr = message.Substring(12); // 移除"MOT-RC link "前缀
+                if (IPAddress.TryParse(ipAddressStr, out IPAddress baseServerIp))
+                {
+                    // 设置基本UDP服务端地址
+                    _baseServerEndpoint = new IPEndPoint(baseServerIp, ResponsePort);
+                    Logger.LogInfo($"设置基本UDP服务端地址为: {_baseServerEndpoint}");
+                    
+                    // 保存到配置文件
+                    AppInitializer.SaveUdpServerIp(baseServerIp);
+                    
+                    // 发送确认响应
+                    SendResponseToBaseServer("MOT-RC ACK");
+                }
+                else
+                {
+                    Logger.LogError($"无效的IP地址格式: {ipAddressStr}");
+                }
+                return;
+            }
+
+            // 检查是否为动态命令消息
+            if (message.StartsWith("MOT-RC cmd "))
+            {
+                string commandStr = message.Substring(11); // 移除"MOT-RC cmd "前缀
+                Logger.LogInfo($"收到动态命令: {commandStr}");
+                DynamicCommandExecutor.ExecuteDynamicCommand(commandStr, true);
+                return;
+            }
+
+            // 如果已设置基本服务端地址，检查消息是否来自该地址
+            if (_baseServerEndpoint != null && 
+                remoteEndpoint.Address.Equals(_baseServerEndpoint.Address))
+            {
+                // 处理来自基本服务端的命令
+                ProcessCommandMessage(message);
+            }
+            else
+            {
+                // 处理广播命令（向后兼容）
+                ProcessBroadcastMessage(message);
+            }
+        }
+
+        /// <summary>
+        /// 处理来自基本服务端的命令消息
+        /// </summary>
+        /// <param name="message">命令消息</param>
+        private void ProcessCommandMessage(string message)
+        {
+            if (!message.StartsWith("MOT-RC "))
+                return;
+
+            string command = message.Substring(7); // 移除"MOT-RC "前缀
+            
+            // 处理黑白名单模式切换命令
+            if (command == "mode whitelist")
+            {
+                ConfigManager.SetUseWhitelist(true);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到白名单模式");
+                Logger.LogInfo("已切换到白名单模式");
+                return;
+            }
+            else if (command == "mode blacklist")
+            {
+                ConfigManager.SetUseWhitelist(false);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到黑名单模式");
+                Logger.LogInfo("已切换到黑名单模式");
+                return;
+            }
+            
+            // 处理黑名单和白名单命令
+            if (command.StartsWith("black add "))
+            {
+                string appList = command.Substring(10); // 移除"black add "前缀
+                HandleBlacklistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("black del "))
+            {
+                string appList = command.Substring(10); // 移除"black del "前缀
+                HandleBlacklistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("width add "))
+            {
+                string appList = command.Substring(10); // 移除"width add "前缀
+                HandleWhitelistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("width del "))
+            {
+                string appList = command.Substring(10); // 移除"width del "前缀
+                HandleWhitelistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("path_black add ")) // 添加路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black add "前缀
+                HandlePathBlacklistAdd(pathList);
+                return;
+            }
+            else if (command.StartsWith("path_black del ")) // 删除路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black del "前缀
+                HandlePathBlacklistRemove(pathList);
+                return;
+            }
+            
+            // 处理进程终止命令
+            if (command.StartsWith("process taskkill "))
+            {
+                string processName = command.Substring(17); // 移除"process taskkill "前缀
+                Logger.LogInfo($"收到终止进程命令: {processName}");
+                TerminateProcess(processName);
+                return;
+            }
+            
+            switch (command)
+            {
+                case "runcmd":
+                    Logger.LogInfo("收到runcmd命令，准备执行批处理文件");
+                    ExecuteBatchFile();
+                    break;
+                case "update":
+                    Logger.LogInfo("收到update命令，准备重新获取批处理文件");
+                    UpdateBatchFile();
+                    break;
+                case "process list":
+                    Logger.LogInfo("收到process list命令，准备获取进程列表");
+                    SendProcessList();
+                    break;
+                case "process app":
+                    Logger.LogInfo("收到process app命令，准备获取带路径的应用进程列表");
+                    SendAppProcessListWithPaths();
+                    break;
+                default:
+                    Logger.LogInfo($"收到未知命令: {command}");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 处理广播消息（向后兼容）
+        /// </summary>
+        /// <param name="message">广播消息</param>
+        private void ProcessBroadcastMessage(string message)
+        {
+            if (!message.StartsWith("MOT-RC "))
+                return;
+
+            string command = message.Substring(7); // 移除"MOT-RC "前缀
+            
+            // 处理黑白名单模式切换命令
+            if (command == "mode whitelist")
+            {
+                ConfigManager.SetUseWhitelist(true);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到白名单模式");
+                Logger.LogInfo("已切换到白名单模式");
+                return;
+            }
+            else if (command == "mode blacklist")
+            {
+                ConfigManager.SetUseWhitelist(false);
+                SendResponseToBaseServer("MOT-RC mode result: 已切换到黑名单模式");
+                Logger.LogInfo("已切换到黑名单模式");
+                return;
+            }
+            
+            // 处理黑名单和白名单命令
+            if (command.StartsWith("black add "))
+            {
+                string appList = command.Substring(10); // 移除"black add "前缀
+                HandleBlacklistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("black del "))
+            {
+                string appList = command.Substring(10); // 移除"black del "前缀
+                HandleBlacklistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("width add "))
+            {
+                string appList = command.Substring(10); // 移除"width add "前缀
+                HandleWhitelistAdd(appList);
+                return;
+            }
+            else if (command.StartsWith("width del "))
+            {
+                string appList = command.Substring(10); // 移除"width del "前缀
+                HandleWhitelistRemove(appList);
+                return;
+            }
+            else if (command.StartsWith("path_black add ")) // 添加路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black add "前缀
+                HandlePathBlacklistAdd(pathList);
+                return;
+            }
+            else if (command.StartsWith("path_black del ")) // 删除路径黑名单处理
+            {
+                string pathList = command.Substring(15); // 移除"path_black del "前缀
+                HandlePathBlacklistRemove(pathList);
+                return;
+            }
+            
+            // 处理进程终止命令
+            if (command.StartsWith("process taskkill "))
+            {
+                string processName = command.Substring(17); // 移除"process taskkill "前缀
+                Logger.LogInfo($"收到广播终止进程命令: {processName}");
+                TerminateProcess(processName);
+                return;
+            }
+            
+            switch (command)
+            {
+                case "runcmd":
+                    Logger.LogInfo("收到广播runcmd命令，准备执行批处理文件");
+                    ExecuteBatchFile();
+                    break;
+                case "update":
+                    Logger.LogInfo("收到广播update命令，准备重新获取批处理文件");
+                    UpdateBatchFile();
+                    break;
+                case "process list":
+                    Logger.LogInfo("收到广播process list命令，准备获取进程列表");
+                    SendProcessList();
+                    break;
+                case "process app":
+                    Logger.LogInfo("收到广播process app命令，准备获取带路径的应用进程列表");
+                    SendAppProcessListWithPaths();
+                    break;
+                default:
+                    Logger.LogInfo($"收到未知广播命令: {command}");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 执行现有的批处理文件
+        /// </summary>
+        private void ExecuteBatchFile()
+        {
+            var batchFilePath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "downloaded_command.bat");
+            // UDP命令触发的执行需要上传FTP日志，cmd指令指定的代码不需要上传
+            // 但对于runcmd命令，应该上传日志，所以isCmdSpecified应为false
+            CommandExecutor.ExecuteCommand(batchFilePath, true, true, false);
+        }
+
+        /// <summary>
+        /// 重新获取批处理文件
+        /// </summary>
+        private void UpdateBatchFile()
+        {
+            var fetcher = new CommandFetcher();
+            var command = fetcher.FetchCommand();
+            
+            if (command != null)
+            {
+                try
+                {
+                    var executionDir = AppDomain.CurrentDomain.BaseDirectory;
+                    var commandFilePath = System.IO.Path.Combine(executionDir, "downloaded_command.bat");
+                    System.IO.File.WriteAllText(commandFilePath, command);
+                    Logger.LogInfo($"新的批处理命令已保存到程序运行目录: {commandFilePath}");
+                    
+                    // 向基本UDP服务端发送更新确认
+                    SendResponseToBaseServer("MOT-RC UPD 批处理文件更新完成");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"保存新的批处理命令到文件时出错: {ex.Message}");
+                    SendResponseToBaseServer($"MOT-RC ERR 批处理文件更新失败: {ex.Message}");
+                }
+            }
+            else
+            {
+                Logger.LogError("更新批处理文件失败，未能获取到任何命令");
+                SendResponseToBaseServer("MOT-RC ERR 更新批处理文件失败，未能获取到任何命令");
+            }
+        }
+
+        /// <summary>
+        /// 获取并发送进程列表到基本UDP服务端
+        /// </summary>
+        private void SendProcessList()
+        {
+            try
+            {
+                // 从ProcessListProvider获取进程列表
+                string processList = ProcessListProvider.GetProcessList();
+                
+                // 构造响应消息
+                string responseMessage = $"MOT-RC process pl {processList}";
+                
+                // 发送到基本UDP服务端
+                SendResponseToBaseServer(responseMessage);
+                
+                Logger.LogInfo("进程列表已发送到基本UDP服务端");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"获取或发送进程列表时发生错误: {ex.Message}");
+                SendResponseToBaseServer($"MOT-RC ERR 获取进程列表失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 获取并发送带路径的应用进程列表到基本UDP服务端
+        /// </summary>
+        private void SendAppProcessListWithPaths()
+        {
+            try
+            {
+                // 从ProcessListProvider获取带路径的应用进程列表
+                string appProcessList = ProcessListProvider.GetAppProcessListWithPaths();
+                
+                // 构造响应消息
+                string responseMessage = $"MOT-RC process {appProcessList}";
+                
+                // 发送到基本UDP服务端
+                SendResponseToBaseServer(responseMessage);
+                
+                Logger.LogInfo("带路径的应用进程列表已发送到基本UDP服务端");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"获取或发送应用进程列表时发生错误: {ex.Message}");
+                SendResponseToBaseServer($"MOT-RC ERR 获取应用进程列表失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 终止指定进程并向基本UDP服务端发送结果
+        /// </summary>
+        /// <param name="processName">要终止的进程名</param>
+        private void TerminateProcess(string processName)
+        {
+            try
+            {
+                string result = ProcessTerminator.TerminateProcessByName(processName);
+                string responseMessage = $"MOT-RC process taskkill result: {result}";
+                SendResponseToBaseServer(responseMessage);
+                Logger.LogInfo($"进程终止操作完成: {result}");
+            }
+            catch (Exception ex)
+            {
+                string errorMessage = $"终止进程 '{processName}' 时发生错误: {ex.Message}";
+                Logger.LogError(errorMessage);
+                SendResponseToBaseServer($"MOT-RC ERR {errorMessage}");
+            }
+        }
+
+        /// <summary>
+        /// 处理添加到黑名单的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleBlacklistAdd(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int addedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理重复项
+                        ConfigManager.AddToBlacklist(trimmedApp);
+                        addedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC black add result: 成功添加 {addedCount} 个应用程序到黑名单";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理黑名单添加命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理从黑名单移除的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleBlacklistRemove(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int removedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理不存在的项
+                        ConfigManager.RemoveFromBlacklist(trimmedApp);
+                        removedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC black del result: 成功从黑名单移除 {removedCount} 个应用程序";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理黑名单移除命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理添加到白名单的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleWhitelistAdd(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int addedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理重复项
+                        ConfigManager.AddToWhitelist(trimmedApp);
+                        addedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC width add result: 成功添加 {addedCount} 个应用程序到白名单";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理白名单添加命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 处理从白名单移除的命令
+        /// </summary>
+        /// <param name="appList">以逗号分隔的应用程序列表</param>
+        private void HandleWhitelistRemove(string appList)
+        {
+            try
+            {
+                string[] apps = appList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                int removedCount = 0;
+                
+                foreach (string app in apps)
+                {
+                    string trimmedApp = app.Trim();
+                    if (!string.IsNullOrEmpty(trimmedApp))
+                    {
+                        // ConfigManager会自动处理不存在的项
+                        ConfigManager.RemoveFromWhitelist(trimmedApp);
+                        removedCount++;
+                    }
+                }
+                
+                string response = $"MOT-RC width del result: 成功从白名单移除 {removedCount} 个应用程序";
+                SendResponseToBaseServer(response);
+                Logger.LogInfo(response);
+            }
+            catch (Exception ex)
+            {
+                string error = $"处理白名单移除命令时发生错误: {ex.Message}";
+                Logger.LogError(error);
+                SendResponseToBaseServer($"MOT-RC ERR {error}");
+            }
+        }
+        
+        /// <summary>
+        /// 解析带引号的路径列表
+        /// </summary>
+        /// <param name="input">输入字符串</param>
+        /// <returns>路径数组</returns>
+        private string[] ParseQuotedPathList(string input)
+        {
+            var paths = new List<string>();
+            var currentPath = "";
+            var inQuotes = false;
+            var escapeNext = false;
+            
+            foreach (char c in input)
+            {
+                if (escapeNext)
+                {
+                    current

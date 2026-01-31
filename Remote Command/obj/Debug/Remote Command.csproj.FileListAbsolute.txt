@@ -1,0 +1,6 @@
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\bin\Debug\Remote_Command.exe
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\bin\Debug\Remote_Command.pdb
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\obj\Debug\Remote Command.csproj.AssemblyReference.cache
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\obj\Debug\Remote Command.csproj.CoreCompileInputs.cache
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\obj\Debug\Remote_Command.exe
+C:\Users\MCOCET\RiderProjects\Remote Command\Remote Command\obj\Debug\Remote_Command.pdb
