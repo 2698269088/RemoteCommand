@@ -47,6 +47,13 @@ namespace Remote_Command
         /// </summary>
         private void CheckNetworkStatus(object state)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                Logger.LogInfo("网卡检测功能已禁用，跳过网络状态检查");
+                return;
+            }
+            
             try
             {
                 // 获取所有网络接口
@@ -82,6 +89,12 @@ namespace Remote_Command
         /// <param name="nic">网络接口</param>
         private void CheckCableStatus(NetworkInterface nic)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                return;
+            }
+            
             try
             {
                 // 只对以太网适配器进行网线连接检查
@@ -127,6 +140,12 @@ namespace Remote_Command
         /// <param name="nic">网络接口</param>
         private void CheckAdapterStatus(NetworkInterface nic)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                return;
+            }
+            
             try
             {
                 // 如果网卡被禁用，则尝试启用它
@@ -193,6 +212,13 @@ namespace Remote_Command
         /// <returns>启用是否成功</returns>
         private bool EnableNetworkAdapter(NetworkInterface nic)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                Logger.LogInfo("网卡检测功能已禁用，跳过网卡启用操作");
+                return false;
+            }
+            
             try
             {
                 // 尝试通过netsh命令启用网络适配器

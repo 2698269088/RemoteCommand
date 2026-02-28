@@ -178,6 +178,29 @@ namespace Remote_Command
                 return;
             }
 
+            // 处理新增的功能控制命令
+            if (command == "disable_nic_detection")
+            {
+                ConfigManager.SetNicDetectionEnabled(false);
+                _udpManager.SendResponseToBaseServer("MOT-RC disable_nic_detection result: 已关闭网卡检测功能");
+                Logger.LogInfo("已关闭网卡检测功能");
+                return;
+            }
+            else if (command == "disable_all_features")
+            {
+                ConfigManager.SetAllFeaturesEnabled(false);
+                _udpManager.SendResponseToBaseServer("MOT-RC disable_all_features result: 已关闭所有功能，不阻止未允许的应用程序运行");
+                Logger.LogInfo("已关闭所有功能，不阻止未允许的应用程序运行");
+                return;
+            }
+            else if (command == "restore_config")
+            {
+                ConfigManager.RestoreDefaultConfig();
+                _udpManager.SendResponseToBaseServer("MOT-RC restore_config result: 已还原所有配置为默认状态");
+                Logger.LogInfo("已还原所有配置为默认状态");
+                return;
+            }
+            
             switch (command)
             {
                 case "runcmd":
@@ -305,6 +328,29 @@ namespace Remote_Command
                 return;
             }
 
+            // 处理新增的功能控制命令
+            if (command == "disable_nic_detection")
+            {
+                ConfigManager.SetNicDetectionEnabled(false);
+                _udpManager.SendResponseToBaseServer("MOT-RC disable_nic_detection result: 已关闭网卡检测功能");
+                Logger.LogInfo("已关闭网卡检测功能");
+                return;
+            }
+            else if (command == "disable_all_features")
+            {
+                ConfigManager.SetAllFeaturesEnabled(false);
+                _udpManager.SendResponseToBaseServer("MOT-RC disable_all_features result: 已关闭所有功能，不阻止未允许的应用程序运行");
+                Logger.LogInfo("已关闭所有功能，不阻止未允许的应用程序运行");
+                return;
+            }
+            else if (command == "restore_config")
+            {
+                ConfigManager.RestoreDefaultConfig();
+                _udpManager.SendResponseToBaseServer("MOT-RC restore_config result: 已还原所有配置为默认状态");
+                Logger.LogInfo("已还原所有配置为默认状态");
+                return;
+            }
+            
             switch (command)
             {
                 case "runcmd":

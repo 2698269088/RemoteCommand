@@ -72,6 +72,13 @@ namespace Remote_Command
         /// </summary>
         private static void CheckAndTerminateProcesses()
         {
+            // 检查所有功能是否启用
+            if (!ConfigManager.GetAllFeaturesEnabled())
+            {
+                Logger.LogInfo("所有功能已禁用，不阻止任何应用程序运行");
+                return;
+            }
+            
             try
             {
                 // 获取所有正在运行的进程

@@ -16,6 +16,10 @@ namespace Remote_Command
         private static bool _useWhitelist = false;
         private static bool _usePathWhitelist = false; // 是否使用路径白名单
         
+        // 全局功能开关配置
+        private static bool _nicDetectionEnabled = true; // 网卡检测功能是否启用
+        private static bool _allFeaturesEnabled = true;  // 所有功能是否启用
+        
         // 添加事件，当黑白名单发生变化时通知其他组件
         public static event Action ConfigChanged;
         
@@ -287,6 +291,71 @@ namespace Remote_Command
         public static bool GetUsePathWhitelist()
         {
             return _usePathWhitelist;
+        }
+        
+        /// <summary>
+        /// 设置网卡检测功能是否启用
+        /// </summary>
+        /// <param name="enabled">true表示启用，false表示禁用</param>
+        public static void SetNicDetectionEnabled(bool enabled)
+        {
+            _nicDetectionEnabled = enabled;
+            Logger.LogInfo($"设置网卡检测功能: {(enabled ? "启用" : "禁用")}");
+        }
+        
+        /// <summary>
+        /// 获取网卡检测功能是否启用
+        /// </summary>
+        /// <returns>true表示启用，false表示禁用</returns>
+        public static bool GetNicDetectionEnabled()
+        {
+            return _nicDetectionEnabled;
+        }
+        
+        /// <summary>
+        /// 设置所有功能是否启用
+        /// </summary>
+        /// <param name="enabled">true表示启用，false表示禁用</param>
+        public static void SetAllFeaturesEnabled(bool enabled)
+        {
+            _allFeaturesEnabled = enabled;
+            Logger.LogInfo($"设置所有功能: {(enabled ? "启用" : "禁用")}");
+        }
+        
+        /// <summary>
+        /// 获取所有功能是否启用
+        /// </summary>
+        /// <returns>true表示启用，false表示禁用</returns>
+        public static bool GetAllFeaturesEnabled()
+        {
+            return _allFeaturesEnabled;
+        }
+        
+        /// <summary>
+        /// 还原所有配置到默认状态
+        /// </summary>
+        public static void RestoreDefaultConfig()
+        {
+            // 清空黑白名单
+            _blacklist.Clear();
+            _whitelist.Clear();
+            
+            // 重置模式设置
+            _useWhitelist = false;
+            _usePathWhitelist = false;
+            
+            // 启用所有功能
+            _nicDetectionEnabled = true;
+            _allFeaturesEnabled = true;
+            
+            // 保存配置
+            SaveConfig();
+            AppInitializer.SaveUseWhitelist(false);
+            
+            // 触发配置变更事件
+            ConfigChanged?.Invoke();
+            
+            Logger.LogInfo("已还原所有配置到默认状态");
         }
     }
 }

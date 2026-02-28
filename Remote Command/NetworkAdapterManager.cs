@@ -71,6 +71,13 @@ namespace Remote_Command
         /// </summary>
         public void CheckNetworkDevices(Action<IPAddress> rebindAction)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                Logger.LogInfo("网卡检测功能已禁用，跳过网络设备检查");
+                return;
+            }
+            
             try
             {
                 var localIp = GetNonVirtualLocalIpAddress();
@@ -119,6 +126,13 @@ namespace Remote_Command
         /// </summary>
         private void TryEnableDisabledAdapters()
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                Logger.LogInfo("网卡检测功能已禁用，跳过网卡启用操作");
+                return;
+            }
+            
             try
             {
                 Logger.LogInfo("尝试启用禁用的物理网卡");
@@ -201,6 +215,13 @@ namespace Remote_Command
         /// </summary>
         public void CheckIpAddressChange(Action<IPAddress> rebindAction)
         {
+            // 检查网卡检测功能是否启用
+            if (!ConfigManager.GetNicDetectionEnabled())
+            {
+                Logger.LogInfo("网卡检测功能已禁用，跳过IP地址变化检查");
+                return;
+            }
+            
             try
             {
                 var currentNonVirtualIp = GetNonVirtualLocalIpAddress();
